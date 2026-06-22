@@ -1,0 +1,45 @@
+{
+  "base_model": "/home/w/vla_workspace/models/smolvla_base",
+  "finetuned_model": "/home/w/vla_workspace/outputs/smolvla_finetuned/checkpoint_5000/pretrained_model",
+  "image_path": "/home/w/mujoco/panda_render.png",
+  "task": "pick up the red block",
+  "first_action_step": {
+    "base_action": [
+      -0.24825960397720337,
+      0.009311877191066742,
+      -0.1680443286895752,
+      0.03459358215332031,
+      0.03717200830578804,
+      -0.5335078239440918
+    ],
+    "finetuned_action": [
+      18.04844093322754,
+      -2.962860107421875,
+      43.11376190185547,
+      22.125518798828125,
+      -24.828275680541992,
+      0.5325493812561035
+    ],
+    "l2_distance": 57.65721130371094,
+    "cosine_similarity": -0.34568697214126587,
+    "per_dim_diff": [
+      18.296701431274414,
+      2.9721720218658447,
+      43.28180694580078,
+      22.090925216674805,
+      24.865447998046875,
+      1.0660572052001953
+    ],
+    "max_dim_diff": 43.28180694580078,
+    "mean_dim_diff": 18.76218605041504
+  },
+  "full_action_chunk": {
+    "l2_distance": 756.3510131835938,
+    "cosine_similarity": 0.23963969945907593,
+    "action_shape": [
+      1,
+      50,
+      6
+    ]
+  }
+}

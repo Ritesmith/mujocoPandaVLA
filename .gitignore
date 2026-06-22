@@ -1,0 +1,53 @@
+# Large data directories
+data/
+models/
+outputs/
+lerobot/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# MuJoCo
+*.mjl
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Trae specs (internal)
+.trae/
+
+# Demo data (regenerable)
+demos/*.npz
+
+# Logs
+*.log
+
+# Model files (too large for git)
+*.zip
+*.pkl
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.onnx
+
+# TensorBoard
+tb_logs/
+events.out.tfevents.*
+
+# Env
+.env
