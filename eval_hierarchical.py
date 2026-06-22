@@ -44,14 +44,18 @@ N_EPISODES = 20
 SEED = 42
 
 
-def make_env(include_target_pos=False):
-    env = gymnasium.make("PandaVLA-v0", reward_type="dense", gravity_comp=True)
+def make_env(include_target_pos=False, target_pos=None):
+    kwargs = dict(reward_type="dense", gravity_comp=True)
+    if target_pos is not None:
+        kwargs["target_pos"] = target_pos
+    env = gymnasium.make("PandaVLA-v0", **kwargs)
     return FlattenObs(env, include_target_pos=include_target_pos)
 
 
-def load_model(model_path, vecnorm_path, include_target_pos=False):
+def load_model(model_path, vecnorm_path, include_target_pos=False, target_pos=None):
     """Load an SB3 PPO model with its VecNormalize stats."""
-    env_factory = lambda: make_env(include_target_pos=include_target_pos)
+    env_factory = lambda: make_env(include_target_pos=include_target_pos,
+                                    target_pos=target_pos)
     vec_env = DummyVecEnv([env_factory])
     if vecnorm_path and os.path.exists(vecnorm_path):
         vec_env = VecNormalize.load(vecnorm_path, vec_env)
@@ -82,7 +86,16 @@ def main():
     parser.add_argument('--include_target_pos', action='store_true',
                         help='Include target_pos in observation (19-dim). '
                              'Required for v15+ models. Default: False (16-dim, for v14 and earlier)')
+    parser.add_argument('--target_pos', type=str, default=None,
+                        help='Override target position as "x,y,z". '
+                             'Default: use env default [0.5, 0.3, 0.2]')
     args = parser.parse_args()
+
+    # Parse target position
+    target_pos = None
+    if args.target_pos:
+        target_pos = np.array([float(v) for v in args.target_pos.split(',')])
+        print(f"Target position override: {target_pos}")
 
     # ---- Load grasp model (v3) ----
     print(f"Loading grasp model: {GRASP_MODEL_PATH}")
@@ -96,7 +109,8 @@ def main():
         print(f"Loading place model: {args.place_model}")
         place_model, place_vec_env = load_model(
             args.place_model, args.place_vecnorm,
-            include_target_pos=args.include_target_pos
+            include_target_pos=args.include_target_pos,
+            target_pos=target_pos
         )
     else:
         print(f"WARNING: place model not found at {args.place_model}")
@@ -113,7 +127,8 @@ def main():
     # place_vec_env stats, so the eval env must NOT wrap VecNormalize. This
     # fixes the VecNormalize mismatch bug where the place model was receiving
     # observations normalized with the grasp model's stats.
-    raw_env = DummyVecEnv([lambda: make_env(include_target_pos=args.include_target_pos)])
+    raw_env = DummyVecEnv([lambda: make_env(include_target_pos=args.include_target_pos,
+                                              target_pos=target_pos)])
 
     # Access the unwrapped PandaVLAEnv to toggle place_mode mid-episode.
     # The place policy was trained in place_mode (block hard-attached to
@@ -226,8 +241,16 @@ def main():
             if phase == "place":
                 obs = place_vec_env.normalize_obs(raw_obs)
             else:
-                # Grasp model uses 16-dim obs; strip target_pos if present
-                raw_obs_for_grasp = raw_obs[:, :16]
+                # Grasp model uses 16-dim obs; strip target_pos if present.
+                # Also replace block_target_distance (dim 15) with the value
+                # for the default target [0.5, 0.3, 0.2], since the grasp
+                # model was trained with that fixed target. Without this,
+                # changing the target position shifts block_target_distance,
+                # which destabilizes the grasp model.
+                raw_obs_for_grasp = raw_obs[:, :16].copy()
+                block_pos = raw_obs_for_grasp[0, 8:11]  # dims 8-10
+                default_target = np.array([0.5, 0.3, 0.2])
+                raw_obs_for_grasp[0, 15] = np.linalg.norm(block_pos - default_target)
                 obs = grasp_vec_env.normalize_obs(raw_obs_for_grasp)
 
             # Predict (calls _detect_phase again — idempotent, see above).
