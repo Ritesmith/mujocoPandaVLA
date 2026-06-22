@@ -184,7 +184,7 @@ def main():
     parser.add_argument('--total_timesteps', type=int, default=300000)
     parser.add_argument(
         '--save_path', type=str,
-        default='/home/w/vla_workspace/outputs/place_policy_v13',
+        default='/home/w/vla_workspace/outputs/place_policy_v14',
     )
     parser.add_argument(
         '--grasp_states', type=str, default=GRASP_STATES_PATH,
