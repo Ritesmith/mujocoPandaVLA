@@ -33,8 +33,8 @@ GRASP_MODEL_PATH = "/home/w/vla_workspace/outputs/dapg_500k_v3/best/best_model.z
 GRASP_VECNORM_PATH = "/home/w/vla_workspace/outputs/dapg_500k_v3/vec_normalize.pkl"
 
 # Default place model path (may not exist yet -> falls back to grasp model)
-PLACE_MODEL_PATH = "/home/w/vla_workspace/outputs/place_policy_v13/best/best_model.zip"
-PLACE_VECNORM_PATH = "/home/w/vla_workspace/outputs/place_policy_v13/best/vec_normalize.pkl"
+PLACE_MODEL_PATH = "/home/w/vla_workspace/outputs/place_policy_v14/best/best_model.zip"
+PLACE_VECNORM_PATH = "/home/w/vla_workspace/outputs/place_policy_v14/best/vec_normalize.pkl"
 
 LIFT_THRESHOLD = 0.03   # m above table (table_z=0.22)
 PLACE_THRESHOLD = 0.05  # m block-target distance
@@ -44,13 +44,14 @@ N_EPISODES = 20
 SEED = 42
 
 
-def make_env():
+def make_env(include_target_pos=False):
     env = gymnasium.make("PandaVLA-v0", reward_type="dense", gravity_comp=True)
-    return FlattenObs(env)
+    return FlattenObs(env, include_target_pos=include_target_pos)
 
 
-def load_model(model_path, vecnorm_path, env_factory):
+def load_model(model_path, vecnorm_path, include_target_pos=False):
     """Load an SB3 PPO model with its VecNormalize stats."""
+    env_factory = lambda: make_env(include_target_pos=include_target_pos)
     vec_env = DummyVecEnv([env_factory])
     if vecnorm_path and os.path.exists(vecnorm_path):
         vec_env = VecNormalize.load(vecnorm_path, vec_env)
@@ -78,12 +79,15 @@ def main():
                         help='Max block height above table (m) to allow release. 0=no gate')
     parser.add_argument('--freeze_arm_on_release', action='store_true',
                         help='Freeze arm movement after gripper opens to prevent pushing block')
+    parser.add_argument('--include_target_pos', action='store_true',
+                        help='Include target_pos in observation (19-dim). '
+                             'Required for v15+ models. Default: False (16-dim, for v14 and earlier)')
     args = parser.parse_args()
 
     # ---- Load grasp model (v3) ----
     print(f"Loading grasp model: {GRASP_MODEL_PATH}")
     grasp_model, grasp_vec_env = load_model(
-        GRASP_MODEL_PATH, GRASP_VECNORM_PATH, make_env
+        GRASP_MODEL_PATH, GRASP_VECNORM_PATH, include_target_pos=False
     )
 
     # ---- Load place model (or fall back to grasp model) ----
@@ -91,7 +95,8 @@ def main():
     if os.path.exists(args.place_model):
         print(f"Loading place model: {args.place_model}")
         place_model, place_vec_env = load_model(
-            args.place_model, args.place_vecnorm, make_env
+            args.place_model, args.place_vecnorm,
+            include_target_pos=args.include_target_pos
         )
     else:
         print(f"WARNING: place model not found at {args.place_model}")
@@ -108,7 +113,7 @@ def main():
     # place_vec_env stats, so the eval env must NOT wrap VecNormalize. This
     # fixes the VecNormalize mismatch bug where the place model was receiving
     # observations normalized with the grasp model's stats.
-    raw_env = DummyVecEnv([make_env])
+    raw_env = DummyVecEnv([lambda: make_env(include_target_pos=args.include_target_pos)])
 
     # Access the unwrapped PandaVLAEnv to toggle place_mode mid-episode.
     # The place policy was trained in place_mode (block hard-attached to
@@ -215,14 +220,15 @@ def main():
                 raw_obs = new_flat[np.newaxis, :].astype(np.float32)
 
             # Normalize obs with the VecNormalize stats matching the active
-            # sub-policy. grasp_vec_env holds the grasp model's stats;
-            # place_vec_env holds the place model's stats. Feeding the place
-            # model grasp-normalized obs (the old bug) produced garbage
-            # actions during the place phase.
+            # sub-policy. grasp_vec_env holds the grasp model's stats (16-dim);
+            # place_vec_env holds the place model's stats (16 or 19-dim).
+            # The grasp model always uses 16-dim obs (no target_pos).
             if phase == "place":
                 obs = place_vec_env.normalize_obs(raw_obs)
             else:
-                obs = grasp_vec_env.normalize_obs(raw_obs)
+                # Grasp model uses 16-dim obs; strip target_pos if present
+                raw_obs_for_grasp = raw_obs[:, :16]
+                obs = grasp_vec_env.normalize_obs(raw_obs_for_grasp)
 
             # Predict (calls _detect_phase again — idempotent, see above).
             action, _ = policy.predict(obs, info=prev_info, deterministic=True)
