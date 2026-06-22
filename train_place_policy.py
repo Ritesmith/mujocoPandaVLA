@@ -82,7 +82,8 @@ class SaveVecNormalizeOnBest(BaseCallback):
 
 
 def make_env(env_id='PandaVLA-v0', reward_type='place_only',
-             grasp_states=None, release_threshold=0.10):
+             grasp_states=None, release_threshold=0.10,
+             target_pos_range=None):
     """Create a place-mode training/eval environment.
 
     Uses place_mode (hard-attached block): the block position is set
@@ -102,6 +103,10 @@ def make_env(env_id='PandaVLA-v0', reward_type='place_only',
             allowed to open. Default 0.10m. Tightening to 0.05m for
             v13 forces the model to navigate closer before releasing,
             reducing post-release drift.
+        target_pos_range: [[x_low, y_low, z_low], [x_high, y_high, z_high]]
+            When set, the target position is randomized within this range
+            on each reset. This trains the policy to generalize to different
+            target positions. Default: None (fixed [0.5, 0.3, 0.2]).
     """
     env = gymnasium.make(
         env_id,
@@ -110,8 +115,9 @@ def make_env(env_id='PandaVLA-v0', reward_type='place_only',
         gravity_comp=True,
         target_pos=np.array([0.5, 0.3, 0.2]),
         grasp_states=grasp_states,
+        target_pos_range=target_pos_range,
     )
-    env = FlattenObs(env)
+    env = FlattenObs(env, include_target_pos=True)
     # Set configurable release threshold on the inner PandaVLAEnv
     env.unwrapped._release_dist_threshold = release_threshold
     return env
@@ -126,14 +132,17 @@ def load_place_demos(demo_path, lift_threshold=0.05):
     (lift_height = obs[10] - 0.22 > lift_threshold) and runs to the end
     of the episode.
 
+    Handles both 16-dim (old) and 19-dim (with target_pos) observations.
+    If demos have 16-dim obs, target_pos [0.5, 0.3, 0.2] is appended.
+
     Args:
-        demo_path: Path to the npz file with keys observations(N,16),
+        demo_path: Path to the npz file with keys observations(N,16 or 19),
             actions(N,8), rewards, next_observations, dones.
         lift_threshold: Lift height (m) above the table that marks the
             start of the place phase.
 
     Returns:
-        place_obs (np.ndarray, (M, 16)): place-phase observations.
+        place_obs (np.ndarray, (M, 19)): place-phase observations.
         place_actions (np.ndarray, (M, 8)): place-phase actions.
     """
     data = np.load(demo_path, allow_pickle=True)
@@ -141,10 +150,17 @@ def load_place_demos(demo_path, lift_threshold=0.05):
     actions = data['actions'].astype(np.float32)
     dones = data['dones'].astype(np.float32)
 
+    # Pad old 16-dim observations with target_pos [0.5, 0.3, 0.2]
+    if observations.shape[1] == 16:
+        target_pos = np.tile(np.array([0.5, 0.3, 0.2], dtype=np.float32),
+                             (len(observations), 1))
+        observations = np.concatenate([observations, target_pos], axis=1)
+
     table_z = 0.22
-    # obs layout (FlattenObs): [joint(7), gripper(1), block_xyz(3),
+    # obs layout (FlattenObs 19-dim): [joint(7), gripper(1), block_xyz(3),
     #                            hand_xyz(3), hand_block_dist(1),
-    #                            block_target_dist(1)] -> obs[10] = block_z
+    #                            block_target_dist(1), target_xyz(3)]
+    # -> obs[10] = block_z
     lift_height = observations[:, 10] - table_z
 
     # Episode boundaries from the dones flag
@@ -214,6 +230,11 @@ def main():
         '--load_vecnorm', type=str, default=None,
         help='Path to vec_normalize.pkl matching --load_model',
     )
+    parser.add_argument(
+        '--target_pos_range', type=str, default=None,
+        help='Target position range as "x_low,y_low,z_low,x_high,y_high,z_high". '
+             'E.g. "0.35,-0.15,0.22,0.65,0.15,0.22". Default: fixed [0.5,0.3,0.2]',
+    )
     args = parser.parse_args()
 
     os.makedirs(args.save_path, exist_ok=True)
@@ -239,11 +260,21 @@ def main():
 
     print(f"Release threshold: {args.release_threshold}m")
 
+    # Parse target position range
+    target_pos_range = None
+    if args.target_pos_range:
+        vals = [float(v) for v in args.target_pos_range.split(',')]
+        assert len(vals) == 6, "target_pos_range must be 6 values: x_low,y_low,z_low,x_high,y_high,z_high"
+        target_pos_range = [[vals[0], vals[1], vals[2]], [vals[3], vals[4], vals[5]]]
+        print(f"Target position range: x=[{vals[0]:.2f},{vals[3]:.2f}], "
+              f"y=[{vals[1]:.2f},{vals[4]:.2f}], z=[{vals[2]:.2f},{vals[5]:.2f}]")
+
     # Create environments (place_mode + place_only reward).
     # See make_env docstring: requires PandaVLAEnv place_mode/place_only support.
     env_kwargs = dict(
         grasp_states=grasp_states,
         release_threshold=args.release_threshold,
+        target_pos_range=target_pos_range,
     )
     train_env = DummyVecEnv([functools.partial(make_env, **env_kwargs)])
     eval_env = DummyVecEnv([functools.partial(make_env, **env_kwargs)])

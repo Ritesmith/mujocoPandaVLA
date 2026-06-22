@@ -12,9 +12,9 @@ Phase transitions are driven by the block's lift height and gripper state
 read from the env info dict, so the policy is agnostic to which sub-policy
 is currently active.
 
-FlattenObs layout (16-dim):
+FlattenObs layout (19-dim):
     [joint_pos(7), gripper(1), block_pos(3), hand_pos(3),
-     hand_block_dist(1), block_target_dist(1)]
+     hand_block_dist(1), block_target_dist(1), target_pos(3)]
 """
 import numpy as np
 

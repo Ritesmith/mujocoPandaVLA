@@ -10,11 +10,13 @@ class FlattenObs(gym.ObservationWrapper):
     Drops: image (not usable by MlpPolicy)
     Also appends: block_position (3,) + hand_position (3,) + hand_block_distance (1,)
                    + block_target_distance (1,) = 8 extra dims
-    Total: 16-dim observation vector
+    Optionally appends: target_position (3,) when include_target_pos=True
+    Total: 16-dim (default) or 19-dim (with target_pos) observation vector
     """
 
-    def __init__(self, env):
+    def __init__(self, env, include_target_pos=False):
         super().__init__(env)
+        self.include_target_pos = include_target_pos
         obs_dict = env.observation_space
         joint_dim = obs_dict["joint_positions"].shape[0]  # 7
         gripper_dim = obs_dict["gripper"].shape[0]  # 1
@@ -23,6 +25,8 @@ class FlattenObs(gym.ObservationWrapper):
         # block_position (3) + hand_position (3) + hand_block_distance (1)
         # + block_target_distance (1) = 8
         extra_dim = 8
+        if include_target_pos:
+            extra_dim += 3  # target_position (3)
 
         total_dim = joint_dim + gripper_dim + extra_dim
         low = np.full(total_dim, -np.inf, dtype=np.float32)
@@ -48,9 +52,14 @@ class FlattenObs(gym.ObservationWrapper):
         hand_block_dist = np.array([info.get("hand_block_distance", 0.0)])
         block_target_dist = np.array([info.get("block_target_distance", 0.0)])
 
-        flat_obs = np.concatenate(
-            [joint_pos, gripper, block_pos, hand_pos, hand_block_dist, block_target_dist]
-        ).astype(np.float32)
+        parts = [joint_pos, gripper, block_pos, hand_pos, hand_block_dist,
+                 block_target_dist]
+
+        if self.include_target_pos:
+            target_pos = info.get("target_position", np.array([0.5, 0.3, 0.2]))
+            parts.append(target_pos)
+
+        flat_obs = np.concatenate(parts).astype(np.float32)
 
         return flat_obs
 

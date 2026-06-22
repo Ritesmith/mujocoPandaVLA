@@ -40,7 +40,7 @@ class PandaVLAEnv(gym.Env):
                  reward_type="dense", target_pos=None,
                  gravity_comp=True, domain_randomize=False,
                  place_mode=False, place_mode_realistic=False,
-                 grasp_states=None):
+                 grasp_states=None, target_pos_range=None):
         super().__init__()
 
         # Model path
@@ -166,6 +166,9 @@ class PandaVLAEnv(gym.Env):
         self._right_finger_id = None
         self._place_gravcomp_active = False
         self._target_pos = target_pos if target_pos is not None else np.array([0.5, 0.3, 0.2])
+        # target_pos_range: [[x_low, y_low, z_low], [x_high, y_high, z_high]]
+        # When set, _target_pos is randomized within this range on each reset.
+        self._target_pos_range = target_pos_range
         self._prev_hand_block_dist = None
         self._prev_block_height = None
         self._prev_block_target_dist = None
@@ -201,6 +204,14 @@ class PandaVLAEnv(gym.Env):
 
         # Restore default physics properties before applying randomization
         self._restore_default_physics()
+
+        # Randomize target position if target_pos_range is set
+        if self._target_pos_range is not None:
+            low = np.array(self._target_pos_range[0])
+            high = np.array(self._target_pos_range[1])
+            self._target_pos = self.np_random.uniform(low, high)
+            # Keep z at table height (0.22) for placing
+            self._target_pos[2] = 0.22
 
         # Set to home keyframe
         home_key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "home")
@@ -746,6 +757,7 @@ class PandaVLAEnv(gym.Env):
                 info["hand_position"] = hand_pos
                 info["hand_block_distance"] = np.linalg.norm(hand_pos - block_pos)
             info["block_target_distance"] = np.linalg.norm(block_pos - self._target_pos)
+            info["target_position"] = self._target_pos.copy()
 
         return info
 
