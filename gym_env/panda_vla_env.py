@@ -40,7 +40,8 @@ class PandaVLAEnv(gym.Env):
                  reward_type="dense", target_pos=None,
                  gravity_comp=True, domain_randomize=False,
                  place_mode=False, place_mode_realistic=False,
-                 grasp_states=None, target_pos_range=None):
+                 grasp_states=None, target_pos_range=None,
+                 better_reward=False):
         super().__init__()
 
         # Model path
@@ -58,6 +59,7 @@ class PandaVLAEnv(gym.Env):
         self.gravity_comp = gravity_comp
         self.domain_randomize = domain_randomize
         self.place_mode = place_mode
+        self.better_reward = better_reward
         self.place_mode_realistic = place_mode_realistic
         self._grasp_states = grasp_states  # collected grasp states for realistic init
 
@@ -172,10 +174,19 @@ class PandaVLAEnv(gym.Env):
         self._prev_hand_block_dist = None
         self._prev_block_height = None
         self._prev_block_target_dist = None
+        self._prev_block_pos = None
         self._place_approach_bonus_given = False
         self._place_proximity_15_given = False
         self._place_proximity_10_given = False
+        self._prox_20 = False
+        self._prox_07 = False
         self._place_success = False
+        self._place_was_holding = True
+        self._place_early_release_penalty_given = False
+        # Reward-safe state (for _compute_reward_safe, place_safe reward_type)
+        self._safe_prev_action = None
+        self._safe_prev_prev_action = None
+        self._safe_release_bonus_given = False
         self._find_bodies()
 
         # Save red_block freejoint qpos address for reset
@@ -196,6 +207,17 @@ class PandaVLAEnv(gym.Env):
         self._default_geom_friction = self.model.geom_friction.copy()
         self._default_body_mass = self.model.body_mass.copy()
         self._default_body_inertia = self.model.body_inertia.copy()
+
+        # Save red_block_geom id for visual domain randomization
+        self._red_block_geom_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, "red_block_geom"
+        )
+
+        # Save default visual properties for domain randomization restore
+        self._default_geom_rgba = self.model.geom_rgba.copy()
+        self._default_light_dir = self.model.light_dir.copy()
+        self._default_light_ambient = self.model.light_ambient.copy()
+        self._default_light_diffuse = self.model.light_diffuse.copy()
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -268,6 +290,34 @@ class PandaVLAEnv(gym.Env):
                 s = 0.02  # half-size
                 I = new_mass * (2*s)**2 / 12.0
                 self.model.body_inertia[block_body_id] = np.array([I, I, I])
+
+            # Visual domain randomization
+            # Randomize light direction and intensity
+            if self.model.nlight > 0:
+                # Randomize light direction (±30 degrees from default [0, 0, -1])
+                angle_x = self.np_random.uniform(-0.5, 0.5)  # ~±30 degrees
+                angle_y = self.np_random.uniform(-0.5, 0.5)
+                self.model.light_dir[0] = [np.sin(angle_x), np.sin(angle_y), -np.cos(angle_x)*np.cos(angle_y)]
+                # Randomize light intensity (scale ambient/diffuse)
+                light_scale = self.np_random.uniform(0.7, 1.3)
+                self.model.light_ambient[0] = 0.3 * light_scale
+                self.model.light_diffuse[0] = np.array([0.6, 0.6, 0.6]) * light_scale
+
+            # Randomize block color
+            block_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "red_block_geom")
+            if block_geom_id >= 0:
+                # Random RGB color, keep alpha=1
+                r = self.np_random.uniform(0.3, 1.0)
+                g = self.np_random.uniform(0.0, 0.5)
+                b = self.np_random.uniform(0.0, 0.5)
+                self.model.geom_rgba[block_geom_id] = [r, g, b, 1.0]
+
+            # Randomize table color
+            table_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "table_top")
+            if table_geom_id >= 0:
+                # Vary wood color tones
+                base = self.np_random.uniform(0.4, 0.7)
+                self.model.geom_rgba[table_geom_id] = [base, base*0.7, base*0.4, 1.0]
 
         # Add small random perturbation to initial position
         if self.np_random is not None:
@@ -427,10 +477,19 @@ class PandaVLAEnv(gym.Env):
         self._prev_hand_block_dist = None
         self._prev_block_height = None
         self._prev_block_target_dist = None
+        self._prev_block_pos = None
         self._place_approach_bonus_given = False
         self._place_proximity_15_given = False
         self._place_proximity_10_given = False
+        self._prox_20 = False
+        self._prox_07 = False
         self._place_success = False
+        self._place_was_holding = True
+        self._place_early_release_penalty_given = False
+        # Reset reward-safe state (for _compute_reward_safe)
+        self._safe_prev_action = None
+        self._safe_prev_prev_action = None
+        self._safe_release_bonus_given = False
 
         obs = self._get_obs()
         info = self._get_info()
@@ -767,7 +826,12 @@ class PandaVLAEnv(gym.Env):
             self._renderer = mujoco.Renderer(
                 self.model, height=self.image_size, width=self.image_size
             )
-        self._renderer.update_scene(self.data)
+        # Use third_person camera if defined, otherwise default
+        cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "third_person")
+        if cam_id >= 0:
+            self._renderer.update_scene(self.data, camera=cam_id)
+        else:
+            self._renderer.update_scene(self.data)
         image = self._renderer.render()
         return image
 
@@ -776,6 +840,13 @@ class PandaVLAEnv(gym.Env):
         self.model.geom_friction[:] = self._default_geom_friction
         self.model.body_mass[:] = self._default_body_mass
         self.model.body_inertia[:] = self._default_body_inertia
+        # Restore default visual properties
+        if hasattr(self, '_default_geom_rgba'):
+            self.model.geom_rgba[:] = self._default_geom_rgba
+        if hasattr(self, '_default_light_dir'):
+            self.model.light_dir[:] = self._default_light_dir
+            self.model.light_ambient[:] = self._default_light_ambient
+            self.model.light_diffuse[:] = self._default_light_diffuse
 
     def _find_bodies(self):
         """Find body IDs for reward computation."""
@@ -823,7 +894,16 @@ class PandaVLAEnv(gym.Env):
         elif self.reward_type == "curriculum_reach":
             return self._compute_reward_curriculum_reach()
         elif self.reward_type == "place_only":
-            return self._compute_reward_place()
+            if self.better_reward:
+                return self._compute_reward_place_better()
+            else:
+                return self._compute_reward_place()
+        elif self.reward_type == "place_only_v2":
+            return self._compute_reward_place_v2()
+        elif self.reward_type == "place_only_soft_release":
+            return self._compute_reward_place_soft_release()
+        elif self.reward_type == "place_safe":
+            return self._compute_reward_safe()
         else:  # "pick_place" (old)
             return self._compute_reward_pick_place()
 
@@ -928,12 +1008,28 @@ class PandaVLAEnv(gym.Env):
         - INCREASED approach bonus: +100 when first reaching dist<0.05
         - Kept lowering bonus, release bonus (gated on table), terminal
 
+        v12 fix (reward hacking via early episode termination):
+        - GATE all continuous/progress rewards on is_holding (gripper closed).
+          Previously the per-step distance penalty (-10*dist) accumulated over
+          episode length, incentivizing the policy to drop the block early to
+          end the episode and stop the penalty. V59-V62 all degraded at step
+          3000 (50%->35%) because PPO discovered this shortcut.
+        - ADD one-time -5 early release penalty: if the block is released
+          away from the target (dist>=0.05 or off table), apply -5 once.
+          This closes the "release and do nothing" escape path that gating
+          alone would leave open (0 > negative holding penalty).
+        - One-time bonuses (proximity, approach) and success/release bonuses
+          are unchanged — they were never hackable (fire once or gated on
+          gripper_open at target).
+
         Components:
-        - Distance penalty: -10.0 * block_target_dist
-        - Block progress: +20.0 * (prev_dist - curr_dist)
+        - Distance penalty: -10.0 * block_target_dist (ONLY while holding)
+        - Height penalty: -2.0 * excess_height (ONLY while holding)
+        - Block progress: +20.0 * (prev_dist - curr_dist) (ONLY while holding)
         - One-time proximity: dist<0.15 -> +20, dist<0.10 -> +50
-        - Lowering bonus: +5.0 * (prev_z - curr_z) when descending
+        - Lowering bonus: +5.0 * (prev_z - curr_z) when descending (ONLY while holding)
         - Approach bonus: dist<0.05 -> +100 (one-time)
+        - Early release penalty: -5.0 one-time if released away from target
         - Release bonus: dist<0.05 AND on table AND gripper open -> +50/step
         - Terminal success: dist<0.05 AND on table AND gripper open -> +200
         """
@@ -972,35 +1068,105 @@ class PandaVLAEnv(gym.Env):
             gripper_open = self.data.qpos[self._finger_qpos_adrs].mean() > 0.02
         block_on_table = block_z < table_z + 0.03  # within 3cm of table
 
+        # v12: is_holding gates all continuous rewards. In place_mode the
+        # block is snapped to the hand at phase switch, so gripper closed
+        # means the block is held. Once the gripper opens (release), the
+        # block is no longer under policy control — stop penalizing.
+        is_holding = not gripper_open
+        at_target = block_target_dist < 0.05 and block_on_table
+
         reward = 0.0
 
-        # 1. Continuous distance penalty
-        reward -= 10.0 * block_target_dist
+        # 1. Continuous distance penalty — v12: ONLY while holding.
+        # v16: coefficient increased to k=5.0 (was 1.0 in V65/V66).
+        # V64(k=0.02), V65(k=1.0), V66(k=1.0+gate) ALL crashed to 5% —
+        # at k<=1.0 the penalty is too weak to dominate per-step positive
+        # rewards (+0.25/step from progress+lowering). V63 (k=10, 40%) was
+        # the only non-crashed version. k=5.0 is the minimum where penalty
+        # dominates positive rewards down to 5cm: -5*0.05=-0.25 = +0.25 pos.
+        # At 15cm: -0.75/step (net -0.50 after positive rewards → urgency).
+        # Total at 15cm/500 steps: -375 (188% of +200 success — strong but
+        # not as crushing as V63's -750).
+        if is_holding:
+            reward -= 5.0 * block_target_dist
 
-        # 2. Block progress toward target (velocity signal)
-        if self._prev_block_target_dist is not None:
-            progress = self._prev_block_target_dist - block_target_dist
-            reward += 20.0 * progress
+            # 1b. Height penalty: discourage lifting block far above table.
+            excess_height = max(0.0, block_z - table_z - 0.10)
+            reward -= 2.0 * excess_height
 
-        # 3. One-time proximity bonuses (v9: replaced per-step to prevent hacking)
-        if block_target_dist < 0.15 and not self._place_proximity_15_given:
-            reward += 20.0
-            self._place_proximity_15_given = True
-        if block_target_dist < 0.10 and not self._place_proximity_10_given:
-            reward += 50.0
-            self._place_proximity_10_given = True
+            # 1c. v17: Hover penalty — replaces v16 progressive reward.
+            # V67 CRASHED to 0% because v16's progressive reward (0.1/(1+dist))
+            # was +0.1/step at dist=0 — the k=5.0 penalty vanishes (-5*0=0),
+            # so hovering at target was net POSITIVE (+0.1/step, ~+48/episode).
+            # Policy learned: approach target → hover without releasing → farm
+            # progressive reward. Same structural flaw as discrete bonuses.
+            #
+            # v17 fix: REMOVE progressive reward entirely. ADD linear hover
+            # penalty that increases as dist decreases below 0.05 (release
+            # threshold). Net per-step is NEGATIVE at all distances:
+            #   dist=0.15: -0.75 + 0    = -0.75 (navigate)
+            #   dist=0.05: -0.25 + 0    = -0.25 (approach)
+            #   dist=0.03: -0.15 - 0.20 = -0.35 (release pressure)
+            #   dist=0.00:  0.00 - 0.50 = -0.50 (must release)
+            # Note: dist=0.05 is a local minimum (derivative discontinuity)
+            # but boundary hover (-0.25/step) is still net-negative, and
+            # releasing (+200 success) dominates when success_rate > 35%.
+            if block_target_dist < 0.05:
+                hover_intensity = (0.05 - block_target_dist) / 0.05  # 0→1 as dist 0.05→0
+                reward -= 0.5 * hover_intensity
 
-        # 4. Lowering bonus
-        # Reward descending block toward table — provides Z-axis signal.
-        if self._prev_block_height is not None and block_z > table_z + 0.03:
+        # 2. Block progress toward target (XY-only velocity signal) — v12: ONLY while holding.
+        # V51 fix: 3D progress diluted the horizontal gradient with Z-movement.
+        # When the block is lifted at wrong XY, 3D distance increases, so the
+        # progress term penalised lifting — directly conflicting with BC's
+        # "lift to 6cm" teaching. XY-only progress removes this Z-conflict,
+        # giving horizontal navigation an undiluted 4:1 advantage over the
+        # lowering bonus (+5/mm Z-descend vs +20/mm XY-move).
+        if is_holding and self._prev_block_pos is not None:
+            prev_xy_dist = float(np.linalg.norm(self._prev_block_pos[:2] - self._target_pos[:2]))
+            curr_xy_dist = float(np.linalg.norm(block_pos[:2] - self._target_pos[:2]))
+            xy_progress = prev_xy_dist - curr_xy_dist
+            reward += 20.0 * xy_progress
+
+        # 3. v16: REMOVED one-time proximity bonuses (+20 at 15cm, +50 at 10cm).
+        # V66 DECOUPLING proved these were hackable: policy collected +170 total
+        # (+20/+50 here + +100 approach below) by approaching target then
+        # hovering — never actually placing. v17: progressive reward also removed
+        # (was hackable at dist=0), replaced by hover penalty (see 1c above).
+
+        # 4. Lowering bonus — v12: ONLY while holding; v15: ONLY when XY aligned with target.
+        # v15 fix: Previously the lowering bonus fired unconditionally on Z descent,
+        # regardless of XY position. This created a Z-descent bias: the policy could
+        # earn +0.05/step by descending at the WRONG XY, then release early (-5)
+        # instead of navigating to the target. At k=1.0 (V65), this bias dominated
+        # the gradient — lift degraded 9.1->6.1cm and place_rate collapsed 50%->5%.
+        # V64(k=0.02) and V65(k=1.0) had IDENTICAL failures despite 50x k difference,
+        # proving the distance penalty coefficient was NOT the determining factor.
+        # Fix: gate on xy_dist < 0.10 (within 10cm of target XY). The policy must
+        # first navigate above the target, THEN descend — aligning the descent
+        # reward with being above the target, removing the "descend anywhere" hack.
+        xy_dist_to_target = float(np.linalg.norm(block_pos[:2] - self._target_pos[:2]))
+        if (is_holding and self._prev_block_height is not None
+                and block_z > table_z + 0.03 and xy_dist_to_target < 0.10):
             height_progress = self._prev_block_height - block_z
             if height_progress > 0:
                 reward += 5.0 * height_progress
 
-        # 5. One-time approach bonus (v9: increased from +10 to +100)
-        if block_target_dist < 0.05 and not self._place_approach_bonus_given:
-            reward += 100.0
-            self._place_approach_bonus_given = True
+        # 5. v16: REMOVED one-time approach bonus (+100 at 5cm). Was hackable
+        # — collectible by reaching 5cm proximity without actual placement.
+        # v17: progressive reward also removed, replaced by hover penalty (1c).
+
+        # 5b. v12: Early release penalty — one-time penalty for releasing the
+        #     block away from the target. Gating the distance penalty alone
+        #     would make releasing (0/step) preferable to holding (-dist/step)
+        #     when far from target. This -5 closes that escape: the policy must
+        #     either hold until target (earning +200 success) or eat the -5.
+        #     Fires once per episode on the holding->released transition.
+        if self._place_was_holding and not is_holding and not self._place_early_release_penalty_given:
+            if not at_target:
+                reward -= 5.0
+            self._place_early_release_penalty_given = True
+        self._place_was_holding = is_holding
 
         # 6. Release bonus: block at target, ON TABLE, gripper open
         if block_target_dist < 0.05 and block_on_table and gripper_open:
@@ -1014,8 +1180,313 @@ class PandaVLAEnv(gym.Env):
         # Update previous values for next step
         self._prev_block_target_dist = block_target_dist
         self._prev_block_height = block_z
+        self._prev_block_pos = block_pos.copy()
 
-        return float(np.clip(reward, -10.0, 400.0))
+        return float(np.clip(reward, -20.0, 400.0))
+
+
+    def _compute_reward_safe(self):
+        """Hack-free place reward for RL from scratch (reward_type='place_safe').
+
+        Design principle: ALL per-step rewards are <= 0. Only terminal rewards
+        (+200 success, +50 release) can be positive, and they fire one-time
+        only. This closes all 4 documented reward hacks:
+          - nv_hover_hack: no positive per-step reward to farm at any distance
+          - nv_unconditional_lowering_bonus: lowering bonus removed entirely
+          - nv_distance_penalty_normalization: distance penalty is linear
+          - nv_reward_decoupling: Isuccess gate stops ALL shaping after success
+
+        Hack-free proof (at dist=0, holding, no jerk/action_diff):
+          reward = 0 (dist) + 0 (height) + 0 (hover) + 0 (jerk) + 0 (action_diff)
+                   + (-0.01) (time) = -0.01  (strictly negative)
+
+        Components (per-step all <= 0 unless noted):
+          - Isuccess gate: return 0.0 if _place_success (stops shaping)
+          - Distance penalty: -5.0 * block_target_dist (while holding)
+          - Height penalty: -2.0 * excess_height (while holding)
+          - Hover penalty: -0.5 * (0.05 - dist)/0.05 (while holding & dist<0.05)
+          - Jerk penalty: -0.001 * ||a_t - 2*a_{t-1} + a_{t-2}||^2
+          - Action diff: -0.005 * ||a_t - a_{t-1}||^2
+          - Time penalty: -0.01 (always)
+          - Early release: -5.0 one-time (if released away from target)
+          - Release bonus: +50.0 one-time (at target, on table, gripper open)
+          - Terminal success: +200.0 one-time (sets _place_success=True)
+        """
+        if self._red_block_id is None:
+            return 0.0
+
+        # Isuccess gating: stop ALL shaping after success
+        if self._place_success:
+            return 0.0
+
+        block_pos = self.data.xpos[self._red_block_id].copy()
+        block_target_dist = float(np.linalg.norm(block_pos - self._target_pos))
+        block_z = float(block_pos[2])
+        table_z = 0.22
+
+        # Gripper check (reuse v17 pattern: _use_gripper_target_check for eval)
+        if getattr(self, '_use_gripper_target_check', False):
+            gripper_open = self._gripper_target > 0.02
+        else:
+            gripper_open = self.data.qpos[self._finger_qpos_adrs].mean() > 0.02
+        block_on_table = block_z < table_z + 0.03
+
+        is_holding = not gripper_open
+        at_target = block_target_dist < 0.05 and block_on_table
+
+        reward = 0.0
+
+        # 1. Continuous penalties — ONLY while holding (gates stop at release)
+        if is_holding:
+            # 1a. Distance penalty (linear, k=5.0 validated in v17)
+            reward -= 5.0 * block_target_dist
+
+            # 1b. Height penalty: discourage lifting block far above table
+            excess_height = max(0.0, block_z - table_z - 0.10)
+            reward -= 2.0 * excess_height
+
+            # 1c. Hover penalty: increases as dist decreases below 0.05
+            #     (prevents hover-farming at release threshold)
+            if block_target_dist < 0.05:
+                hover_intensity = (0.05 - block_target_dist) / 0.05  # 0->1
+                reward -= 0.5 * hover_intensity
+
+        # 2. Jerk penalty: -0.001 * ||a_t - 2*a_{t-1} + a_{t-2}||^2
+        #    Requires 2 previous actions. Skipped on first 2 steps of episode.
+        if (self._safe_prev_action is not None
+                and self._safe_prev_prev_action is not None
+                and hasattr(self, '_last_action') and self._last_action is not None):
+            jerk = self._last_action - 2.0 * self._safe_prev_action + self._safe_prev_prev_action
+            reward -= 0.001 * float(np.sum(np.square(jerk)))
+
+        # 3. Action diff penalty: -0.005 * ||a_t - a_{t-1}||^2 (smoothness)
+        if (self._safe_prev_action is not None
+                and hasattr(self, '_last_action') and self._last_action is not None):
+            action_diff = self._last_action - self._safe_prev_action
+            reward -= 0.005 * float(np.sum(np.square(action_diff)))
+
+        # 4. Time penalty (always, encourages efficiency)
+        reward -= 0.01
+
+        # 5. Early release penalty — one-time, if released away from target
+        #    (reuse v17 pattern: _place_was_holding transition detection)
+        if self._place_was_holding and not is_holding and not self._place_early_release_penalty_given:
+            if not at_target:
+                reward -= 5.0
+            self._place_early_release_penalty_given = True
+        self._place_was_holding = is_holding
+
+        # 6. Release bonus: +50 one-time (at target, on table, gripper open)
+        if block_target_dist < 0.05 and block_on_table and gripper_open:
+            if not self._safe_release_bonus_given:
+                reward += 50.0
+                self._safe_release_bonus_given = True
+
+        # 7. Terminal success: +200 one-time (sets _place_success=True)
+        if block_target_dist < 0.05 and block_on_table and gripper_open:
+            reward += 200.0
+            self._place_success = True
+
+        # Update action history for jerk/action_diff (must happen after use)
+        if hasattr(self, '_last_action') and self._last_action is not None:
+            self._safe_prev_prev_action = self._safe_prev_action
+            self._safe_prev_action = self._last_action.copy()
+
+        # Update block tracking (for compatibility, though not used in shaping)
+        self._prev_block_target_dist = block_target_dist
+        self._prev_block_height = block_z
+        self._prev_block_pos = block_pos.copy()
+
+        return float(np.clip(reward, -20.0, 400.0))
+
+
+    def _compute_reward_place_better(self):
+        """Improved place-only reward with better intermediate signals.
+
+        Key improvements over _compute_reward_place():
+        1. Directional reward: encourages moving toward target using cosine
+           similarity between block velocity and target direction
+        2. Height shaping: rewards keeping block near target height (not just
+           penalizing extreme height)
+        3. Progressive proximity: multi-level distance-based rewards that
+           encourage approaching target step by step
+
+        Components:
+        - Distance penalty: -10.0 * block_target_dist
+        - Directional reward: +5.0 * cos(theta) * |v| when moving toward target
+        - Height shaping: -10.0 * (block_z - target_z)^2 (keep near target height)
+        - Block progress: +20.0 * (prev_dist - curr_dist)
+        - Progressive proximity: dist<0.25→+2, <0.20→+5, <0.15→+10, <0.10→+25
+        - Lowering bonus: +5.0 * descent when above table
+        - Approach bonus: dist<0.05 -> +100 (one-time)
+        - Release bonus: dist<0.05 AND on table AND gripper open -> +50/step
+        - Terminal success: dist<0.05 AND on table AND gripper open -> +200
+        """
+        if self._red_block_id is None:
+            return 0.0
+
+        block_pos = self.data.xpos[self._red_block_id].copy()
+        block_target_dist = float(np.linalg.norm(block_pos - self._target_pos))
+        block_z = float(block_pos[2])
+        table_z = 0.22
+        target_z = float(self._target_pos[2])
+
+        if getattr(self, '_use_gripper_target_check', False):
+            gripper_open = self._gripper_target > 0.02
+        else:
+            gripper_open = self.data.qpos[self._finger_qpos_adrs].mean() > 0.02
+        block_on_table = block_z < table_z + 0.03
+
+        reward = 0.0
+
+        # 1. Continuous distance penalty
+        reward -= 10.0 * block_target_dist
+
+        # 2. Directional reward: encourage moving toward target
+        if self._prev_block_target_dist is not None and self._prev_block_pos is not None:
+            target_dir = (self._target_pos - block_pos) / (block_target_dist + 1e-6)
+            block_vel = (block_pos - self._prev_block_pos) / max(self.model.opt.timestep * self.n_substeps, 1e-6)
+            vel_mag = float(np.linalg.norm(block_vel))
+            if vel_mag > 0.01:
+                vel_dir = block_vel / vel_mag
+                cos_theta = float(np.dot(target_dir, vel_dir))
+                if cos_theta > 0:
+                    reward += 5.0 * cos_theta * vel_mag
+
+        # 3. Height shaping: keep block near target height
+        height_diff = block_z - target_z
+        reward -= 10.0 * (height_diff ** 2)
+
+        # 4. Block progress toward target (velocity signal)
+        if self._prev_block_target_dist is not None:
+            progress = self._prev_block_target_dist - block_target_dist
+            reward += 20.0 * progress
+
+        # 5. Progressive proximity rewards (multi-level)
+        if block_target_dist < 0.25 and not getattr(self, '_place_proximity_25_given', False):
+            reward += 2.0
+            self._place_proximity_25_given = True
+        if block_target_dist < 0.20 and not getattr(self, '_place_proximity_20_given', False):
+            reward += 5.0
+            self._place_proximity_20_given = True
+        if block_target_dist < 0.15 and not getattr(self, '_place_proximity_15_given', False):
+            reward += 10.0
+            self._place_proximity_15_given = True
+        if block_target_dist < 0.10 and not getattr(self, '_place_proximity_10_given', False):
+            reward += 25.0
+            self._place_proximity_10_given = True
+
+        # 6. Lowering bonus
+        if self._prev_block_height is not None and block_z > table_z + 0.03:
+            height_progress = self._prev_block_height - block_z
+            if height_progress > 0:
+                reward += 5.0 * height_progress
+
+        # 7. One-time approach bonus
+        if block_target_dist < 0.05 and not getattr(self, '_place_approach_bonus_given', False):
+            reward += 100.0
+            self._place_approach_bonus_given = True
+
+        # 8. Release bonus: block at target, ON TABLE, gripper open
+        if block_target_dist < 0.05 and block_on_table and gripper_open:
+            reward += 50.0
+
+        # 9. Terminal success
+        if block_target_dist < 0.05 and block_on_table and gripper_open:
+            reward += 200.0
+            self._place_success = True
+
+        # Update previous values
+        self._prev_block_target_dist = block_target_dist
+        self._prev_block_height = block_z
+        self._prev_block_pos = block_pos.copy()
+
+        return float(np.clip(reward, -30.0, 450.0))
+
+
+    def _compute_reward_place_v2(self):
+        """Place-only reward v6: denser proximity shaping."""
+        if self._red_block_id is None:
+            return 0.0
+        block_pos = self.data.xpos[self._red_block_id].copy()
+        block_target_dist = float(np.linalg.norm(block_pos - self._target_pos))
+        block_z = float(block_pos[2])
+        table_z = 0.22
+        if getattr(self, '_use_gripper_target_check', False):
+            gripper_open = self._gripper_target > 0.02
+        else:
+            gripper_open = self.data.qpos[self._finger_qpos_adrs].mean() > 0.02
+        block_on_table = block_z < table_z + 0.03
+        reward = 0.0
+        reward -= 15.0 * block_target_dist
+        excess_height = max(0.0, block_z - table_z - 0.10)
+        reward -= 2.0 * excess_height
+        if self._prev_block_target_dist is not None:
+            progress = self._prev_block_target_dist - block_target_dist
+            reward += 25.0 * progress
+        if block_target_dist < 0.20 and not getattr(self, '_prox_20', False):
+            reward += 10.0; self._prox_20 = True
+        if block_target_dist < 0.15 and not self._place_proximity_15_given:
+            reward += 20.0; self._place_proximity_15_given = True
+        if block_target_dist < 0.10 and not self._place_proximity_10_given:
+            reward += 50.0; self._place_proximity_10_given = True
+        if block_target_dist < 0.07 and not getattr(self, '_prox_07', False):
+            reward += 70.0; self._prox_07 = True
+        if self._prev_block_height is not None and block_z > table_z + 0.03:
+            hp = self._prev_block_height - block_z
+            if hp > 0: reward += 8.0 * hp
+        if block_target_dist < 0.05 and not self._place_approach_bonus_given:
+            reward += 150.0; self._place_approach_bonus_given = True
+        if block_target_dist < 0.05 and block_on_table and gripper_open:
+            reward += 50.0
+        if block_target_dist < 0.05 and block_on_table and gripper_open:
+            reward += 200.0; self._place_success = True
+        self._prev_block_target_dist = block_target_dist
+        self._prev_block_height = block_z
+        return float(np.clip(reward, -20.0, 500.0))
+
+    def _compute_reward_place_soft_release(self):
+        """Place reward v7: soft release - model learns when to open gripper."""
+        if self._red_block_id is None:
+            return 0.0
+        block_pos = self.data.xpos[self._red_block_id].copy()
+        block_target_dist = float(np.linalg.norm(block_pos - self._target_pos))
+        block_z = float(block_pos[2])
+        table_z = 0.22
+        if getattr(self, '_use_gripper_target_check', False):
+            gripper_open = self._gripper_target > 0.02
+        else:
+            gripper_open = self.data.qpos[self._finger_qpos_adrs].mean() > 0.02
+        block_on_table = block_z < table_z + 0.03
+        reward = 0.0
+        reward -= 15.0 * block_target_dist
+        excess_height = max(0.0, block_z - table_z - 0.10)
+        reward -= 2.0 * excess_height
+        if self._prev_block_target_dist is not None:
+            progress = self._prev_block_target_dist - block_target_dist
+            reward += 25.0 * progress
+        if block_target_dist < 0.20 and not getattr(self, '_prox_20', False):
+            reward += 10.0; self._prox_20 = True
+        if block_target_dist < 0.15 and not self._place_proximity_15_given:
+            reward += 20.0; self._place_proximity_15_given = True
+        if block_target_dist < 0.10 and not self._place_proximity_10_given:
+            reward += 50.0; self._place_proximity_10_given = True
+        if block_target_dist < 0.07 and not getattr(self, '_prox_07', False):
+            reward += 70.0; self._prox_07 = True
+        if self._prev_block_height is not None and block_z > table_z + 0.03:
+            hp = self._prev_block_height - block_z
+            if hp > 0: reward += 8.0 * hp
+        if block_target_dist < 0.05 and not self._place_approach_bonus_given:
+            reward += 150.0; self._place_approach_bonus_given = True
+        # SOFT RELEASE: reward for opening gripper, scaled by proximity
+        if gripper_open and block_on_table:
+            release_quality = max(0.0, 1.0 - block_target_dist / 0.15)
+            reward += 100.0 * release_quality
+        if block_target_dist < 0.05 and block_on_table and gripper_open:
+            reward += 300.0; self._place_success = True
+        self._prev_block_target_dist = block_target_dist
+        self._prev_block_height = block_z
+        return float(np.clip(reward, -20.0, 500.0))
 
     def _compute_reward_curriculum_reach(self):
         """Curriculum stage 1: Only reaching reward."""

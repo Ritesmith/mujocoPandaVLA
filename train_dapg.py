@@ -22,13 +22,16 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 import argparse
 import functools
 import gymnasium
+from gymnasium import spaces
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import gym_env
 from gym_env.wrappers import FlattenObs
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from stable_baselines3.common.utils import explained_variance
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 
@@ -83,57 +86,256 @@ class DAPGPPO(PPO):
     """PPO with Demo-Augmented Policy Gradient.
 
     Overrides the train() method to add BC regularization from demo data.
+    Supports both flat state vectors (MlpPolicy) and Dict observations
+    {"image", "state"} (MultiInputPolicy).
     """
 
     def __init__(self, *args, demo_obs=None, demo_actions=None,
                  lambda_bc=0.5, bc_decay=0.8, total_timesteps=100000,
-                 **kwargs):
+                 image_augment=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.demo_obs = demo_obs
         self.demo_actions = demo_actions
         self.lambda_bc = lambda_bc
         self.bc_decay = bc_decay
         self.total_timesteps = total_timesteps
+        self.image_augment = image_augment
         self._bc_loss_fn = nn.MSELoss()
 
-    def train(self):
-        """PPO train with added BC regularization."""
-        # Run standard PPO training
-        super().train()
+    def _get_vec_normalize(self):
+        """Traverse the env wrapper chain to find VecNormalize.
 
-        # Add BC loss from demo data
-        if self.demo_obs is None or len(self.demo_obs) == 0:
-            return
+        For vision mode the chain is VecTransposeImage -> VecNormalize ->
+        DummyVecEnv, so ``self.env`` alone is not enough.
+        """
+        env = self.env
+        while env is not None:
+            if isinstance(env, VecNormalize):
+                return env
+            env = getattr(env, "venv", None)
+        return None
 
-        # Compute BC weight with decay
-        progress = self.num_timesteps / max(self.total_timesteps, 1)
-        current_lambda = self.lambda_bc * (self.bc_decay ** (progress * 10))
+    def _normalize_demo_state(self, states):
+        """Normalize demo ``state`` using VecNormalize running statistics.
 
-        # Sample demo batch
-        batch_size = min(256, len(self.demo_obs))
-        indices = np.random.randint(0, len(self.demo_obs), size=batch_size)
-        demo_obs_batch = torch.tensor(
-            self.demo_obs[indices], dtype=torch.float32, device=self.device
-        )
+        VecNormalize normalizes on-policy state observations but not images.
+        To keep the BC demo inputs on the same distribution as on-policy
+        data, we replicate the normalization here. For Dict observations
+        ``obs_rms`` is a dict keyed by the normalized observation keys.
+        """
+        vec_norm = self._get_vec_normalize()
+        if vec_norm is None:
+            return states
+        obs_rms = vec_norm.obs_rms
+        if isinstance(obs_rms, dict) and "state" in obs_rms:
+            state_rms = obs_rms["state"]
+            mean = torch.as_tensor(
+                state_rms.mean, dtype=torch.float32, device=states.device
+            )
+            var = torch.as_tensor(
+                state_rms.var, dtype=torch.float32, device=states.device
+            )
+            states = (states - mean) / torch.sqrt(var + vec_norm.epsilon)
+            states = torch.clamp(states, -vec_norm.clip_obs, vec_norm.clip_obs)
+        return states
+
+
+    def _augment_images(self, images):
+        """Apply random augmentations to a batch of images (CHW float).
+
+        Safe augmentations only: random crop, brightness, contrast.
+        No flips (would break spatial correspondence with actions/target).
+        """
+        import torch.nn.functional as F
+        batch_size = images.shape[0]
+        H, W = images.shape[2], images.shape[3]
+
+        # 1. Random crop: pad by 4 on each side, then random crop back
+        if torch.rand(1).item() < 0.5:
+            padded = F.pad(images, (4, 4, 4, 4), mode='replicate')
+            crops_h = torch.randint(0, 9, (batch_size,))
+            crops_w = torch.randint(0, 9, (batch_size,))
+            cropped = []
+            for i in range(batch_size):
+                cropped.append(
+                    padded[i, :, crops_h[i]:crops_h[i]+H, crops_w[i]:crops_w[i]+W]
+                )
+            images = torch.stack(cropped)
+
+        # 2. Random brightness: +/- 15 (on 0-255 scale)
+        if torch.rand(1).item() < 0.5:
+            brightness = torch.empty(batch_size, 1, 1, 1, device=images.device).uniform_(-15, 15)
+            images = images + brightness
+
+        # 3. Random contrast: 0.85 to 1.15
+        if torch.rand(1).item() < 0.5:
+            contrast = torch.empty(batch_size, 1, 1, 1, device=images.device).uniform_(0.85, 1.15)
+            images = images * contrast
+
+        return images.clamp(0, 255)
+
+    def _compute_bc_loss(self, batch_size):
+        """Compute BC loss on a random mini-batch of demo data.
+
+        Samples ``batch_size`` demo transitions, runs them through the
+        policy's actor path (feature_extractor → mlp_extractor → action_net),
+        and returns the MSE between policy mean_actions and demo actions.
+
+        Returns None if no demo data is available.
+        """
+        if self.demo_obs is None:
+            return None
+
+        if isinstance(self.demo_obs, dict):
+            n_demos = len(self.demo_obs["image"])
+        else:
+            n_demos = len(self.demo_obs)
+        if n_demos == 0:
+            return None
+
+        bc_batch_size = min(batch_size, n_demos)
+        indices = np.random.randint(0, n_demos, size=bc_batch_size)
         demo_act_batch = torch.tensor(
             self.demo_actions[indices], dtype=torch.float32, device=self.device
         )
 
-        # Get policy mean actions on demo observations
+        if isinstance(self.demo_obs, dict):
+            demo_images = torch.as_tensor(
+                self.demo_obs["image"][indices], device=self.device
+            )
+            demo_states = torch.as_tensor(
+                self.demo_obs["state"][indices],
+                dtype=torch.float32, device=self.device
+            )
+            demo_states = self._normalize_demo_state(demo_states)
+            demo_images = demo_images.permute(0, 3, 1, 2).contiguous().float()
+            if getattr(self, 'image_augment', False):
+                demo_images = self._augment_images(demo_images)
+            demo_obs_batch = {"image": demo_images, "state": demo_states}
+        else:
+            demo_obs_batch = torch.tensor(
+                self.demo_obs[indices], dtype=torch.float32, device=self.device
+            )
+
         features = self.policy.extract_features(demo_obs_batch)
         latent_pi = self.policy.mlp_extractor.forward_actor(features)
         mean_actions = self.policy.action_net(latent_pi)
 
-        # BC loss: MSE between policy output and demo actions
         bc_loss = self._bc_loss_fn(mean_actions, demo_act_batch)
+        return bc_loss
 
-        # Add BC gradient to policy parameters
-        total_loss = current_lambda * bc_loss
-        total_loss.backward()
+    def train(self):
+        """DAPG-PPO joint training: PPO clipped objective + BC regularization.
 
-        # Log
-        self.logger.record("train/bc_loss", bc_loss.item())
-        self.logger.record("train/lambda_bc", current_lambda)
+        BC loss is computed per mini-batch and ADDED to the PPO loss before
+        a single optimizer.step(), so PPO and BC gradients are applied
+        together in the same update. This is the standard DAPG formulation:
+
+            L = L_policy + c_ent * L_entropy + c_vf * L_value + lambda_bc * L_BC
+
+        V59 bug fix: the previous implementation called super().train() (full
+        PPO loop) then computed BC loss.backward() WITHOUT optimizer.step().
+        The next PPO update's zero_grad() cleared the BC gradients before they
+        were ever applied — lambda_bc had zero effect throughout V50-V59.
+        """
+        self.policy.set_training_mode(True)
+        self._update_learning_rate(self.policy.optimizer)
+        clip_range = self.clip_range(self._current_progress_remaining)
+        if self.clip_range_vf is not None:
+            clip_range_vf = self.clip_range_vf(self._current_progress_remaining)
+
+        entropy_losses = []
+        pg_losses, value_losses = [], []
+        clip_fractions = []
+        bc_losses = []
+
+        # BC weight with exponential decay over training progress
+        progress = self.num_timesteps / max(self.total_timesteps, 1)
+        current_lambda = self.lambda_bc * (self.bc_decay ** (progress * 10))
+        has_demos = self.demo_obs is not None
+
+        continue_training = True
+        for epoch in range(self.n_epochs):
+            approx_kl_divs = []
+            for rollout_data in self.rollout_buffer.get(self.batch_size):
+                actions = rollout_data.actions
+                if isinstance(self.action_space, spaces.Discrete):
+                    actions = rollout_data.actions.long().flatten()
+
+                values, log_prob, entropy = self.policy.evaluate_actions(
+                    rollout_data.observations, actions)
+                values = values.flatten()
+                advantages = rollout_data.advantages
+                if self.normalize_advantage and len(advantages) > 1:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+                ratio = torch.exp(log_prob - rollout_data.old_log_prob)
+                policy_loss_1 = advantages * ratio
+                policy_loss_2 = advantages * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+                policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
+
+                pg_losses.append(policy_loss.item())
+                clip_fraction = torch.mean((torch.abs(ratio - 1) > clip_range).float()).item()
+                clip_fractions.append(clip_fraction)
+
+                if self.clip_range_vf is None:
+                    values_pred = values
+                else:
+                    values_pred = rollout_data.old_values + torch.clamp(
+                        values - rollout_data.old_values, -clip_range_vf, clip_range_vf)
+                value_loss = F.mse_loss(rollout_data.returns, values_pred)
+                value_losses.append(value_loss.item())
+
+                if entropy is None:
+                    entropy_loss = -torch.mean(-log_prob)
+                else:
+                    entropy_loss = -torch.mean(entropy)
+                entropy_losses.append(entropy_loss.item())
+
+                # Joint loss: PPO + BC (single backward + step applies both)
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+
+                if has_demos:
+                    bc_loss = self._compute_bc_loss(self.batch_size)
+                    if bc_loss is not None:
+                        loss = loss + current_lambda * bc_loss
+                        bc_losses.append(bc_loss.item())
+
+                with torch.no_grad():
+                    log_ratio = log_prob - rollout_data.old_log_prob
+                    approx_kl_div = torch.mean(
+                        (torch.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                    approx_kl_divs.append(approx_kl_div)
+
+                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
+                    continue_training = False
+                    if self.verbose >= 1:
+                        print(f"Early stopping at step {epoch} due to max kl: {approx_kl_div:.4f}")
+                    break
+
+                # Optimization step: PPO + BC gradients applied together
+                self.policy.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.policy.optimizer.step()
+
+            self._n_updates += 1
+            if not continue_training:
+                break
+
+        explained_var = explained_variance(
+            self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
+
+        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+        self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
+        self.logger.record("train/loss", loss.item())
+        self.logger.record("train/explained_variance", explained_var)
+        if bc_losses:
+            self.logger.record("train/bc_loss", np.mean(bc_losses))
+            self.logger.record("train/lambda_bc", current_lambda)
 
 
 def make_env(env_id, reward_type='dense'):

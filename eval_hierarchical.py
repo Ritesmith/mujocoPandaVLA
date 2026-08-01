@@ -33,8 +33,8 @@ GRASP_MODEL_PATH = "/home/w/vla_workspace/outputs/dapg_500k_v3/best/best_model.z
 GRASP_VECNORM_PATH = "/home/w/vla_workspace/outputs/dapg_500k_v3/vec_normalize.pkl"
 
 # Default place model path (may not exist yet -> falls back to grasp model)
-PLACE_MODEL_PATH = "/home/w/vla_workspace/outputs/place_policy_v14/best/best_model.zip"
-PLACE_VECNORM_PATH = "/home/w/vla_workspace/outputs/place_policy_v14/best/vec_normalize.pkl"
+PLACE_MODEL_PATH = "/home/w/vla_workspace/outputs/place_policy_v17/best/best_model.zip"
+PLACE_VECNORM_PATH = "/home/w/vla_workspace/outputs/place_policy_v17/best/vec_normalize.pkl"
 
 LIFT_THRESHOLD = 0.03   # m above table (table_z=0.22)
 PLACE_THRESHOLD = 0.05  # m block-target distance
@@ -42,29 +42,52 @@ TABLE_Z = 0.22
 MAX_STEPS = 500
 N_EPISODES = 20
 SEED = 42
+# Match hierarchical_policy.GRASP_TO_PLACE_LIFT (0.02): an episode "enters
+# the place phase" when lift exceeds this. LIFT_THRESHOLD (0.03) is a
+# stricter grab-success metric. The gap [0.02, 0.03] creates "gray zone"
+# episodes that enter place but are not counted as grabbed.
+PHASE_SWITCH_LIFT = 0.02  # m: matches hierarchical_policy threshold
 
 
-def make_env(include_target_pos=False, target_pos=None):
+def make_env(vision_mode=False, include_target_pos=False, target_pos=None,
+             target_pos_range=None, domain_randomize=True):
     kwargs = dict(reward_type="dense", gravity_comp=True)
     if target_pos is not None:
         kwargs["target_pos"] = target_pos
+    if target_pos_range is not None:
+        kwargs["target_pos_range"] = target_pos_range
+    kwargs["domain_randomize"] = domain_randomize
     env = gymnasium.make("PandaVLA-v0", **kwargs)
-    return FlattenObs(env, include_target_pos=include_target_pos)
+    if vision_mode:
+        from gym_env.wrappers import VisionObs
+        env = VisionObs(env, image_size=84)
+    else:
+        env = FlattenObs(env, include_target_pos=include_target_pos)
+    return env
 
 
-def load_model(model_path, vecnorm_path, include_target_pos=False, target_pos=None):
+def load_model(model_path, vecnorm_path, vision_mode=False, include_target_pos=False, target_pos=None,
+               target_pos_range=None, domain_randomize=True):
     """Load an SB3 PPO model with its VecNormalize stats."""
-    env_factory = lambda: make_env(include_target_pos=include_target_pos,
-                                    target_pos=target_pos)
+    env_factory = lambda: make_env(vision_mode=vision_mode,
+                                    include_target_pos=include_target_pos,
+                                    target_pos=target_pos,
+                                    target_pos_range=target_pos_range,
+                                    domain_randomize=domain_randomize)
     vec_env = DummyVecEnv([env_factory])
     if vecnorm_path and os.path.exists(vecnorm_path):
         vec_env = VecNormalize.load(vecnorm_path, vec_env)
         vec_env.norm_reward = False
         vec_env.training = False
     else:
+        # For vision (Dict) obs, only normalize the "state" key; pass image
+        # through unchanged (uint8 [0,255] should not be running-mean scaled).
+        norm_obs_keys = ["state"] if vision_mode else None
         vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=False,
-                               clip_obs=10.0)
+                               clip_obs=10.0, norm_obs_keys=norm_obs_keys)
         vec_env.training = False
+    # PPO.load infers policy type (MultiInputPolicy for vision, MlpPolicy
+    # otherwise) from the saved model file.
     model = PPO.load(model_path, env=vec_env, device="auto")
     return model, vec_env
 
@@ -75,7 +98,13 @@ def main():
                         help='Path to place policy .zip')
     parser.add_argument('--place_vecnorm', type=str, default=PLACE_VECNORM_PATH,
                         help='Path to place policy vec_normalize.pkl')
+    parser.add_argument('--grasp_model', type=str, default=None,
+                        help='Path to grasp policy .zip (default: v3 hardcoded)')
+    parser.add_argument('--grasp_vecnorm', type=str, default=None,
+                        help='Path to grasp vec_normalize.pkl')
     parser.add_argument('--n_episodes', type=int, default=N_EPISODES)
+    parser.add_argument('--num_episodes', type=int, default=None,
+                        help='Number of episodes (alias for --n_episodes)')
     parser.add_argument('--max_steps', type=int, default=MAX_STEPS)
     parser.add_argument('--release_threshold', type=float, default=0.05,
                         help='Release distance threshold (m) for place phase')
@@ -89,7 +118,38 @@ def main():
     parser.add_argument('--target_pos', type=str, default=None,
                         help='Override target position as "x,y,z". '
                              'Default: use env default [0.5, 0.3, 0.2]')
+    parser.add_argument('--target_pos_range', type=str, default=None,
+                        help='Target position range as "x_low,y_low,z_low,x_high,y_high,z_high". '
+                             'E.g. "0.35,-0.15,0.22,0.65,0.15,0.22".')
+    parser.add_argument('--vision_mode', action='store_true',
+                        help='Use vision observation (image + state Dict) for '
+                             'the place model. Grasp model always uses state '
+                             '(16-dim FlattenObs).')
+    parser.add_argument('--domain_randomize', action='store_true',
+                        help='Enable domain randomization')
+    parser.add_argument('--no_domain_randomize', action='store_true',
+                        help='Disable domain randomization')
+    parser.add_argument('--stochastic_place', action='store_true',
+                        help='Use stochastic (deterministic=False) actions for '
+                             'the place model. Default: deterministic=True.')
+    parser.add_argument('--action_scale', type=float, default=1.0,
+                        help='Scale factor for place model actions. '
+                             'Default: 1.0 (no scaling).')
+    parser.add_argument('--place_log_std', type=float, default=None,
+                        help='Override place model log_std (e.g. -2.3 for '
+                             'std=0.1). Implies --stochastic_place.')
     args = parser.parse_args()
+
+    if args.num_episodes is not None:
+        args.n_episodes = args.num_episodes
+
+    domain_randomize = not args.no_domain_randomize and args.domain_randomize
+    if args.no_domain_randomize:
+        domain_randomize = False
+    elif args.domain_randomize:
+        domain_randomize = True
+    else:
+        domain_randomize = False
 
     # Parse target position
     target_pos = None
@@ -97,20 +157,39 @@ def main():
         target_pos = np.array([float(v) for v in args.target_pos.split(',')])
         print(f"Target position override: {target_pos}")
 
-    # ---- Load grasp model (v3) ----
-    print(f"Loading grasp model: {GRASP_MODEL_PATH}")
+    # Parse target position range
+    target_pos_range = None
+    if args.target_pos_range:
+        vals = [float(v) for v in args.target_pos_range.split(',')]
+        assert len(vals) == 6, "target_pos_range must be 6 values: x_low,y_low,z_low,x_high,y_high,z_high"
+        target_pos_range = [[vals[0], vals[1], vals[2]], [vals[3], vals[4], vals[5]]]
+        print(f"Target position range: x=[{vals[0]:.2f},{vals[3]:.2f}], "
+              f"y=[{vals[1]:.2f},{vals[4]:.2f}], z=[{vals[2]:.2f},{vals[5]:.2f}]")
+
+    print(f"Domain randomization: {'enabled' if domain_randomize else 'disabled'}")
+
+    # ---- Load grasp model ----
+    gm_path = args.grasp_model or GRASP_MODEL_PATH
+    gv_path = args.grasp_vecnorm or GRASP_VECNORM_PATH
+    print(f"Loading grasp model: {gm_path}")
     grasp_model, grasp_vec_env = load_model(
-        GRASP_MODEL_PATH, GRASP_VECNORM_PATH, include_target_pos=False
+        gm_path, gv_path, include_target_pos=False,
+        target_pos_range=target_pos_range, domain_randomize=domain_randomize
     )
 
     # ---- Load place model (or fall back to grasp model) ----
+    # The grasp model ALWAYS uses state-mode (16-dim FlattenObs). Only the
+    # place model can use vision_mode (Dict {image, state} -> MultiInputPolicy).
     place_fallback = False
     if os.path.exists(args.place_model):
         print(f"Loading place model: {args.place_model}")
         place_model, place_vec_env = load_model(
             args.place_model, args.place_vecnorm,
+            vision_mode=args.vision_mode,
             include_target_pos=args.include_target_pos,
-            target_pos=target_pos
+            target_pos=target_pos,
+            target_pos_range=target_pos_range,
+            domain_randomize=domain_randomize
         )
     else:
         print(f"WARNING: place model not found at {args.place_model}")
@@ -119,8 +198,21 @@ def main():
         place_vec_env = grasp_vec_env
         place_fallback = True
 
+    # ---- Override place model log_std if requested ----
+    if args.place_log_std is not None:
+        import torch
+        with torch.no_grad():
+            place_model.policy.log_std.data.fill_(args.place_log_std)
+        new_std = float(place_model.policy.log_std.data.exp().mean().item())
+        print(f"Override place log_std -> {args.place_log_std:.4f} "
+              f"(std={new_std:.4f})")
+        args.stochastic_place = True  # log_std override requires stochastic
+
     # ---- Build hierarchical policy ----
-    policy = HierarchicalPickPlacePolicy(grasp_model, place_model)
+    policy = HierarchicalPickPlacePolicy(
+        grasp_model, place_model,
+        place_deterministic=not args.stochastic_place,
+        action_scale=args.action_scale)
 
     # ---- Eval environment (raw, unwrapped) ----
     # We normalize observations manually per-phase using grasp_vec_env /
@@ -128,7 +220,9 @@ def main():
     # fixes the VecNormalize mismatch bug where the place model was receiving
     # observations normalized with the grasp model's stats.
     raw_env = DummyVecEnv([lambda: make_env(include_target_pos=args.include_target_pos,
-                                              target_pos=target_pos)])
+                                              target_pos=target_pos,
+                                              target_pos_range=target_pos_range,
+                                              domain_randomize=domain_randomize)])
 
     # Access the unwrapped PandaVLAEnv to toggle place_mode mid-episode.
     # The place policy was trained in place_mode (block hard-attached to
@@ -147,6 +241,21 @@ def main():
     print(f"Release threshold: {args.release_threshold}m, height gate: "
           f"{args.release_height if args.release_height > 0 else 'off'}m")
 
+    # For vision_mode: build a VisionObs wrapper around the SAME underlying
+    # PandaVLAEnv so we can construct Dict obs {image, state} for the place
+    # model on demand. The eval raw_env stays FlattenObs-wrapped (16-dim) so
+    # the grasp phase and env stepping are unchanged; we only swap the obs
+    # representation for the place phase by calling
+    # place_vision_wrapper.observation(_inner_env._get_obs()).
+    place_vision_wrapper = None
+    if args.vision_mode and not place_fallback:
+        from gym_env.wrappers import VisionObs
+        place_vision_wrapper = VisionObs(_inner_env, image_size=84)
+        print("Vision mode enabled: place model uses Dict obs {image, state}")
+    elif args.vision_mode and place_fallback:
+        print("Vision mode requested but place model fell back to grasp "
+              "(state-only). Place phase will use 16-dim state obs.")
+
     np.random.seed(SEED)
     try:
         raw_env.seed(SEED)
@@ -156,6 +265,7 @@ def main():
     # ---- Run episodes ----
     grab_flags, place_flags, pickplace_flags = [], [], []
     max_lifts, final_dists = [], []
+    grasp_max_lifts, place_max_lifts = [], []
     phase_switch_steps = []
 
     for ep in range(args.n_episodes):
@@ -164,8 +274,11 @@ def main():
         _inner_env._place_gravcomp_active = False
         raw_obs = raw_env.reset()
         policy.reset()
+        ep_target_pos = _inner_env._target_pos.copy()
         ep_reward = 0.0
         max_lift = 0.0
+        grasp_phase_max_lift = 0.0  # max lift during grasp phase only
+        place_phase_max_lift = 0.0  # max lift during place phase only
         block_target_dist = float("inf")
         block_grabbed_at = None
         first_place_step = None
@@ -236,10 +349,32 @@ def main():
 
             # Normalize obs with the VecNormalize stats matching the active
             # sub-policy. grasp_vec_env holds the grasp model's stats (16-dim);
-            # place_vec_env holds the place model's stats (16 or 19-dim).
-            # The grasp model always uses 16-dim obs (no target_pos).
+            # place_vec_env holds the place model's stats (16/19-dim state, or
+            # Dict {image, state} for vision_mode). The grasp model always
+            # uses 16-dim obs (no target_pos).
             if phase == "place":
-                obs = place_vec_env.normalize_obs(raw_obs)
+                if place_vision_wrapper is not None:
+                    # Vision place model: build Dict obs {image, state} from
+                    # the underlying env's raw obs (reflects snapped block /
+                    # current physics state), batch to (1, ...) and normalize.
+                    # Only "state" is normalized; "image" passes through.
+                    vision_obs = place_vision_wrapper.observation(
+                        _inner_env._get_obs()
+                    )
+                    vision_obs_batched = {
+                        "image": vision_obs["image"][np.newaxis, ...],
+                        "state": vision_obs["state"][np.newaxis, ...],
+                    }
+                    obs = place_vec_env.normalize_obs(vision_obs_batched)
+                    # FIX: transpose image from HWC (1,84,84,3) to CHW
+                    # (1,3,84,84). Training wraps the env with
+                    # VecTransposeImage which converts HWC->CHW before the
+                    # policy sees it; eval constructs obs manually and must
+                    # match. Without this, the CNN receives HWC images but
+                    # was trained on CHW, causing 0% place rate.
+                    obs["image"] = np.transpose(obs["image"], (0, 3, 1, 2))
+                else:
+                    obs = place_vec_env.normalize_obs(raw_obs)
             else:
                 # Grasp model uses 16-dim obs; strip target_pos if present.
                 # Also replace block_target_distance (dim 15) with the value
@@ -278,6 +413,13 @@ def main():
             lift = max(0.0, block_h - TABLE_Z)
             if lift > max_lift:
                 max_lift = lift
+            # Track lift per phase for diagnosis
+            if first_place_step is not None:
+                if lift > place_phase_max_lift:
+                    place_phase_max_lift = lift
+            else:
+                if lift > grasp_phase_max_lift:
+                    grasp_phase_max_lift = lift
             if lift > LIFT_THRESHOLD and block_grabbed_at is None:
                 block_grabbed_at = step
 
@@ -285,6 +427,7 @@ def main():
                 break
 
         grabbed = max_lift > LIFT_THRESHOLD
+        entered_place = first_place_step is not None  # phase switched at least once
         placed = block_target_dist < PLACE_THRESHOLD
         pickplace = grabbed and placed
 
@@ -294,11 +437,15 @@ def main():
         max_lifts.append(max_lift)
         final_dists.append(block_target_dist)
         phase_switch_steps.append(first_place_step)
+        grasp_max_lifts.append(grasp_phase_max_lift)
+        place_max_lifts.append(place_phase_max_lift)
 
         print(f"Ep {ep:2d}: max_lift={max_lift*100:5.1f}cm  "
               f"final_dist={block_target_dist*100:5.1f}cm  "
               f"place_step={first_place_step if first_place_step is not None else '  -'}  "
-              f"grab={'Y' if grabbed else 'N'} place={'Y' if placed else 'N'}")
+              f"grab={'Y' if grabbed else 'N'} place={'Y' if placed else 'N'}"
+              f"  [grasp={grasp_phase_max_lift*100:.1f}cm place={place_phase_max_lift*100:.1f}cm]"
+              f"  target=[{ep_target_pos[0]:.3f},{ep_target_pos[1]:.3f},{ep_target_pos[2]:.3f}]")
 
     raw_env.close()
 
@@ -324,6 +471,11 @@ def main():
     print(f"Best max lift         : {np.max(max_lifts)*100:.1f} cm")
     print(f"Mean final dist       : {np.mean(final_dists)*100:.1f} cm")
     print(f"Best final dist       : {np.min(final_dists)*100:.1f} cm")
+    # Per-phase lift diagnosis: high grasp-phase lift with low place-phase
+    # success suggests the grasp model lifts the arm too high, starting
+    # place from an out-of-distribution arm configuration.
+    print(f"Mean grasp-phase lift : {np.mean(grasp_max_lifts)*100:.1f} cm")
+    print(f"Mean place-phase lift : {np.mean(place_max_lifts)*100:.1f} cm")
 
     valid_switches = [s for s in phase_switch_steps if s is not None]
     if valid_switches:

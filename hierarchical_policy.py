@@ -39,11 +39,14 @@ class HierarchicalPickPlacePolicy:
     GRIPPER_OPEN_THRESHOLD = 0.03  # m: gripper considered open above this
     MIN_GRASP_STEPS = 20          # min steps in grasp phase before switching
 
-    def __init__(self, grasp_model, place_model):
+    def __init__(self, grasp_model, place_model,
+                 place_deterministic=True, action_scale=1.0):
         self.grasp_model = grasp_model
         self.place_model = place_model
         self.phase = "grasp"
         self.phase_steps = 0
+        self.place_deterministic = place_deterministic
+        self.action_scale = action_scale
 
     def reset(self):
         """Reset phase tracking at the start of a new episode."""
@@ -114,7 +117,10 @@ class HierarchicalPickPlacePolicy:
         self.phase_steps += 1
 
         if phase == "place":
-            action, _ = self.place_model.predict(obs, deterministic=deterministic)
+            action, _ = self.place_model.predict(
+                obs, deterministic=self.place_deterministic)
+            if self.action_scale != 1.0:
+                action = action * self.action_scale
         else:
             action, _ = self.grasp_model.predict(obs, deterministic=deterministic)
 
