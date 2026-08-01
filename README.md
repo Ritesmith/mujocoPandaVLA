@@ -1,5 +1,7 @@
 # MuJoCo Panda VLA — Offline RL (IQL) for Robotic Pick-and-Place
 
+**[中文版](README_CN.md)** | English
+
 Offline Reinforcement Learning (Implicit Q-Learning) with a hierarchical grasp + place policy for the Franka Panda arm in MuJoCo simulation, evaluated under a rigorous pre-registered statistical protocol.
 
 ---
