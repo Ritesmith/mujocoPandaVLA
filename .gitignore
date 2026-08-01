@@ -4,6 +4,15 @@ models/
 outputs/
 lerobot/
 
+# Subprojects (too large, separate repos if needed)
+parking_vlm_project/
+
+# Auto-iteration products (regenerable, 5G+)
+auto_iter/
+
+# Archived experiments (kept locally, not version controlled)
+archive/
+
 # Python
 __pycache__/
 *.pyc
