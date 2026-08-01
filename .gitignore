@@ -1,6 +1,8 @@
-# Large data directories
-data/
-models/
+# Large data directories (ignore binaries, but track .py source)
+data/*
+!data/*.py
+models/*
+!models/*.py
 outputs/
 lerobot/
 

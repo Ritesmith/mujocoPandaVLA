@@ -48,10 +48,10 @@ pip install -r requirements.txt
 conda activate vla
 
 # 3. Train the IQL agent (final baseline: tau=0.5, no regularization)
-python train_iql.py --tau 0.5 --beta 3.0 --gamma 0.99 --n_step 5 --chunk_size 4
+python -m core.train_iql --tau 0.5 --beta 3.0 --gamma 0.99 --n_step 5 --chunk_size 4
 
 # 4. Evaluate a checkpoint (200 episodes)
-python evaluate_iql_env.py --checkpoint <path_to_model.pt> --n_episodes 200
+python -m core.evaluate_iql_env --checkpoint <path_to_model.pt> --n_episodes 200
 ```
 
 The trained checkpoint defaults can be overridden via `--output_dir` (training) and `--checkpoint` / `--seed` (evaluation). For the full multi-seed statistical pipeline, see the [Statistical Framework](#statistical-framework) section.
@@ -100,34 +100,77 @@ This framework is what separated the real Phase 7 win (tau tuning, CV −62%) fr
 ## Project Structure
 
 ```
-├── iql_agent.py                 # IQL agent: expectile V + twin Q + AWR policy
-├── iql_dataset.py               # Offline dataset loader (n-step returns)
-├── train_iql.py                 # Training entry point
-├── evaluate_iql_env.py          # MuJoCo evaluation (200 episodes, paired design)
-├── gym_env/                     # Panda MuJoCo environment + hierarchical policy
-├── hierarchical_policy.py       # Grasp + Place two-stage decomposition
+├── core/                        # Core IQL: agent, dataset, training, evaluation
+│   ├── iql_agent.py             # IQL agent: expectile V + twin Q + AWR policy
+│   ├── iql_dataset.py           # Offline dataset loader (n-step returns)
+│   ├── train_iql.py             # Training entry point
+│   ├── evaluate_iql_env.py      # MuJoCo evaluation (200 episodes, paired design)
+│   ├── evaluate_iql_policy.py   # IQL policy evaluation utilities
+│   ├── hierarchical_policy.py   # Grasp + Place two-stage decomposition
+│   ├── eval_hierarchical.py     # Hierarchical policy evaluation
+│   ├── train_place_policy.py    # Place sub-policy training
+│   ├── train_dapg.py            # DAPG/PPO training
+│   └── pretrained_cnn.py        # Pretrained ResNet feature extractor
 │
-├── preregister_and_validate.py  # Pre-registration + R1-R6 decision gate
-├── analyze_multi_seed.py        # Multi-seed stats: TOST, CI, Cohen's d
-├── bootstrap_power_analysis.py  # Power analysis for experiment planning
-├── multi_seed_eval.py           # Multi-seed paired evaluation runner
-├── phase7_*.py                  # Phase 7: training-stability tooling (tau sweep, TOST)
-├── phase8_*.py                  # Phase 8: DT Router retraining + 3-node monitoring
+├── analysis/                    # Statistical analysis & validation
+│   ├── preregister_and_validate.py  # Pre-registration + R1-R6 decision gate
+│   ├── analyze_multi_seed.py    # Multi-seed stats: TOST, CI, Cohen's d
+│   ├── bootstrap_power_analysis.py  # Power analysis for experiment planning
+│   ├── bootstrap_cv_ci.py / bca_bootstrap_cv.py  # Bootstrap CV confidence intervals
+│   ├── variance_attribution.py  # Variance attribution
+│   ├── multi_seed_eval.py       # Multi-seed paired evaluation runner
+│   ├── phase7_*.py              # Phase 7: training-stability tooling (tau sweep, TOST)
+│   ├── phase8_*.py              # Phase 8: DT Router retraining + 3-node monitoring
+│   └── automate_phase7_vl2.py   # Phase 7 automation
 │
-├── run_v*.py                    # historical iteration scripts (see pipeline_scripts/README.md)
-│   (run_v63 … run_v71b)         #   NOT active code — legacy PPO pipeline iterations
-├── dt_*.py                      # archived (Phase 8 DT Router, not active)
-│   (dt_codebook, dt_trainer,    #   effect not significant; kept for reproducibility only
-│    dt_feature_extractor, ...)
+├── data/                        # Data collection scripts (*.npz data files are gitignored)
+│   ├── collect_expert_demos.py  # Expert demonstration collection
+│   ├── collect_dagger_data.py   # DAgger data collection
+│   ├── collect_d_fail.py / collect_rejection_sampling.py / collect_successful_trajectories.py
+│   ├── dagger_oracle.py         # DAgger oracle
+│   ├── cache_resnet_features.py # Cache ResNet features
+│   └── make_dcsil_stochastic.py
 │
+├── models/                      # Policy training & model variants
+│   ├── train_bc_only.py / train_bc_expert.py / train_shallow_bc.py
+│   ├── train_csil_plus_plus.py  # CSIL++ PBRS
+│   ├── train_diffusion_policy.py / diffusion_policy_model.py
+│   ├── train_online_dagger.py / train_policy_distillation.py / train_rl_from_scratch.py
+│   ├── backbone_probe.py / ensemble_predict.py
+│   └── eval_bc_vs_v59.py / orchestrator.py
+│
+├── diagnostics/                 # Diagnostics & failure analysis
+│   ├── diagnose_nondeterminism.py / diagnose_reward_density.py
+│   ├── diagnose_v59_sensitivity.py / diagnose_ensemble_weights.py
+│   ├── analyze_drift_physics.py / failure_mode_clustering.py
+│   └── bench_env_speed.py / voronoi_partition.py
+│
+├── dt_router/                   # Phase 8 DT Router (archived — effect not significant)
+│   ├── dt_codebook.py / dt_trainer.py
+│   ├── dt_feature_extractor.py / dt_outcomes_parser.py
+│   └── dt_overlap_analysis.py
+│
+├── pipeline_scripts/            # Historical iteration scripts (NOT active code)
+│   ├── run_v63_pipeline.py … run_v71b_pipeline.py
+│   └── run_pipeline_common.py
+│
+├── scripts/                     # Shell pipeline runners (.sh)
+│   ├── run_tau0.5_N30.sh / run_csil_plus_plus_pipeline.sh
+│   └── run_dfail_bc_pipeline.sh / run_voronoi_pipeline.sh
+│
+├── docs/                        # Documentation
+│   ├── SIMULATOR_EVAL.md
+│   └── solution_summary.md
+│
+├── gym_env/                     # Panda MuJoCo environment (stays in root)
+├── tests/                       # Test suite
 ├── CHANGELOG.md                 # Full project history (V5–V59 evolution)
 ├── CHANGELOG_PHASE7.md          # Phase 7: tau tuning & stability
 ├── CHANGELOG_PHASE8.md          # Phase 8: DT Router & V_CV validation
-├── requirements.txt             # Python dependencies
-└── tests/                       # Test suite
+└── requirements.txt             # Python dependencies
 ```
 
-> **Note:** `run_v*.py` (v63–v71b) are historical PPO-era iteration pipeline scripts retained for reproducibility; they are **not** part of the active IQL codebase. `dt_*.py` files are archived DT Router experiments from Phase 8 whose effect did not reach significance and are not active.
+> **Note:** After the directory reorganization, all modules live under packages (`core/`, `analysis/`, `data/`, `models/`, `diagnostics/`, `dt_router/`, `pipeline_scripts/`). Run them as modules from the repo root, e.g. `python -m core.train_iql`. `pipeline_scripts/run_v*.py` (v63–v71b) are historical PPO-era iteration scripts retained for reproducibility and are **not** part of the active IQL codebase. `dt_router/` files are archived DT Router experiments from Phase 8 whose effect did not reach significance and are not active.
 
 ---
 
